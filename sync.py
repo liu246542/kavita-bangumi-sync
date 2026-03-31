@@ -30,6 +30,17 @@ def load_config():
         return json.load(f)
 
 
+def load_overrides():
+    """Load manual series name → Bangumi ID mappings."""
+    override_path = Path(__file__).parent / "overrides.json"
+    if not override_path.exists():
+        return {}
+    with open(override_path) as f:
+        data = json.load(f)
+    # Filter out non-mapping keys like _comment
+    return {k: v for k, v in data.items() if isinstance(v, int)}
+
+
 # ─── Kavita API ──────────────────────────────────────────────────────────────
 
 class KavitaClient:
@@ -152,11 +163,14 @@ class BangumiClient:
             for item in candidates:
                 if item.get("name_cn") == query:
                     return item
-            # Partial match
-            for item in candidates:
-                cn = item.get("name_cn", "")
-                if cn and (query in cn or cn in query):
-                    return item
+            # Partial match — pick the one with most ratings (most popular)
+            partial = [
+                item for item in candidates
+                if item.get("name_cn") and
+                   (query in item["name_cn"] or item["name_cn"] in query)
+            ]
+            if partial:
+                return max(partial, key=lambda x: x.get("rating", {}).get("total", 0))
             # First result
             return candidates[0]
 
@@ -290,6 +304,9 @@ def main():
     # Init clients
     kavita = KavitaClient(kc["base_url"], kc["username"], kc["password"])
     bangumi = BangumiClient(bc["base_url"], bc["user_agent"], bc.get("rate_limit_delay", 0.4))
+    overrides = load_overrides()
+    if overrides:
+        print(f"已加载 {len(overrides)} 条手动映射")
 
     # Get all series
     print("\n获取 Kavita 系列列表...")
@@ -327,9 +344,25 @@ def main():
                 stats["skipped"] += 1
                 continue
 
-        # Search Bangumi
-        search_title = name
-        bgm_result = bangumi.search(search_title)
+        # Check overrides first, then search Bangumi
+        override_id = overrides.get(name)
+        bgm_result = None
+        if override_id:
+            # Direct lookup by Bangumi ID
+            bgm_detail_direct = bangumi.get_subject(override_id)
+            if bgm_detail_direct:
+                bgm_result = {
+                    "id": override_id,
+                    "name_cn": bgm_detail_direct.get("name_cn", ""),
+                    "name": bgm_detail_direct.get("name", ""),
+                    "rating": bgm_detail_direct.get("rating", {}),
+                    "rank": bgm_detail_direct.get("rank"),
+                    "summary": bgm_detail_direct.get("summary", ""),
+                }
+                print(f" [映射]", end="")
+
+        if not bgm_result:
+            bgm_result = bangumi.search(name)
 
         # If not found, try localized name
         if not bgm_result and localized and localized != name:
