@@ -1,0 +1,12 @@
+{
+  "kavita": {
+    "base_url": "http://localhost:5000",
+    "username": "",
+    "password": ""
+  },
+  "bangumi": {
+    "base_url": "https://api.bgm.tv",
+    "user_agent": "kavita-bangumi-sync/1.0",
+    "rate_limit_delay": 0.4
+  }
+}
