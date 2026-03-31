@@ -1,7 +1,7 @@
 config.json
+overrides.json
 __pycache__/
 *.pyc
 .env
 last_sync_results.json
 CLAUDE.md
-last_sync_results.json
