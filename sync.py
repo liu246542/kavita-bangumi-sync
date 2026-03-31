@@ -170,7 +170,7 @@ class BangumiClient:
 
 # ─── Metadata Mapping ───────────────────────────────────────────────────────
 
-def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata):
+def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False):
     """Map Bangumi data to Kavita's SeriesMetadataDto format."""
     meta = existing_metadata.copy()
 
@@ -200,12 +200,12 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata):
 
     enhanced_summary = "".join(parts)
 
-    if enhanced_summary and not meta.get("summaryLocked"):
+    if enhanced_summary and (force or not meta.get("summaryLocked")):
         meta["summary"] = enhanced_summary
         meta["summaryLocked"] = True
 
     # Tags from Bangumi
-    if bgm_detail and not meta.get("tagsLocked"):
+    if bgm_detail and (force or not meta.get("tagsLocked")):
         bgm_tags = bgm_detail.get("tags", [])
         # Take top 10 tags by count
         top_tags = sorted(bgm_tags, key=lambda t: t.get("count", 0), reverse=True)[:10]
@@ -217,10 +217,10 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata):
                 if tag_name.lower() not in existing_names:
                     existing_tags.append({"id": 0, "title": tag_name})
             meta["tags"] = existing_tags
-            meta["tagsLocked"] = True
+            meta["tagsLocked"] = False
 
     # Genres from Bangumi infobox
-    if bgm_detail and not meta.get("genresLocked"):
+    if bgm_detail and (force or not meta.get("genresLocked")):
         # Map Bangumi type to genre
         bgm_type = bgm_detail.get("platform", "")
         if bgm_type and bgm_type not in [g.get("title") for g in meta.get("genres", [])]:
@@ -239,7 +239,7 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata):
                 meta["webLinks"] = bgm_url
 
     # Writers/staff from Bangumi detail
-    if bgm_detail and not meta.get("writerLocked"):
+    if bgm_detail and (force or not meta.get("writerLocked")):
         infobox = bgm_detail.get("infobox", [])
         writers = meta.get("writers", [])
         existing_writer_names = {w.get("name", "").lower() for w in writers}
@@ -249,18 +249,18 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata):
             if key in ("作者", "原作", "脚本"):
                 val = info.get("value", "")
                 if isinstance(val, str) and val.lower() not in existing_writer_names:
-                    writers.append({"id": 0, "name": val, "role": 1})
+                    writers.append({"id": 0, "name": val})
                     existing_writer_names.add(val.lower())
                 elif isinstance(val, list):
                     for v in val:
                         name = v.get("v", "") if isinstance(v, dict) else str(v)
                         if name and name.lower() not in existing_writer_names:
-                            writers.append({"id": 0, "name": name, "role": 1})
+                            writers.append({"id": 0, "name": name})
                             existing_writer_names.add(name.lower())
 
         if writers:
             meta["writers"] = writers
-            meta["writerLocked"] = True
+            meta["writerLocked"] = False
 
     return meta
 
@@ -341,7 +341,7 @@ def main():
         bgm_detail = bangumi.get_subject(bgm_id) if bgm_id else None
 
         # Map metadata
-        updated_meta = map_bangumi_to_kavita(bgm_result, bgm_detail, meta)
+        updated_meta = map_bangumi_to_kavita(bgm_result, bgm_detail, meta, force=args.force)
 
         if args.dry_run:
             print(f" [DRY RUN]")
