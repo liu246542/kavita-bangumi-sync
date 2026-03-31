@@ -242,15 +242,14 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
             genres.append({"id": 0, "title": bgm_type})
             meta["genres"] = genres
 
-    # WebLinks - add Bangumi link
+    # WebLinks - add/replace Bangumi link
     if bgm_id:
         bgm_url = f"https://bgm.tv/subject/{bgm_id}"
         existing_links = meta.get("webLinks", "") or ""
-        if bgm_url not in existing_links:
-            if existing_links:
-                meta["webLinks"] = existing_links + "," + bgm_url
-            else:
-                meta["webLinks"] = bgm_url
+        # Remove any old bgm.tv links first
+        other_links = [l for l in existing_links.split(",") if l.strip() and "bgm.tv" not in l]
+        other_links.append(bgm_url)
+        meta["webLinks"] = ",".join(other_links)
 
     # Writers/staff from Bangumi detail
     if bgm_detail and (force or not meta.get("writerLocked")):
