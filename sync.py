@@ -241,22 +241,31 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
     # Writers/staff from Bangumi detail
     if bgm_detail and (force or not meta.get("writerLocked")):
         infobox = bgm_detail.get("infobox", [])
-        writers = meta.get("writers", [])
+        # When forcing, start fresh to remove stale/merged entries
+        writers = [] if force else meta.get("writers", [])
         existing_writer_names = {w.get("name", "").lower() for w in writers}
+
+        def _split_names(text):
+            """Split author string by common separators: 、× / +"""
+            return [n.strip() for n in re.split(r'[、×/+]', text) if n.strip()]
+
+        def _add_writer(name):
+            if name and name.lower() not in existing_writer_names:
+                writers.append({"id": 0, "name": name})
+                existing_writer_names.add(name.lower())
 
         for info in infobox:
             key = info.get("key", "")
             if key in ("作者", "原作", "脚本"):
                 val = info.get("value", "")
-                if isinstance(val, str) and val.lower() not in existing_writer_names:
-                    writers.append({"id": 0, "name": val})
-                    existing_writer_names.add(val.lower())
+                if isinstance(val, str):
+                    for name in _split_names(val):
+                        _add_writer(name)
                 elif isinstance(val, list):
                     for v in val:
                         name = v.get("v", "") if isinstance(v, dict) else str(v)
-                        if name and name.lower() not in existing_writer_names:
-                            writers.append({"id": 0, "name": name})
-                            existing_writer_names.add(name.lower())
+                        for n in _split_names(name):
+                            _add_writer(n)
 
         if writers:
             meta["writers"] = writers
