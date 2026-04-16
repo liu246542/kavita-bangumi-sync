@@ -18,6 +18,15 @@ import urllib.error
 import argparse
 from pathlib import Path
 
+try:
+    from opencc import OpenCC
+    _t2s = OpenCC("t2s")
+    def to_simplified(text):
+        return _t2s.convert(text)
+except ImportError:
+    def to_simplified(text):
+        return text
+
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
@@ -96,6 +105,27 @@ class KavitaClient:
         """Get metadata for a specific series."""
         return self._request("GET", f"/api/series/metadata?seriesId={series_id}")
 
+    def upload_series_cover(self, series_id, image_url):
+        """Upload a cover image for a series. Downloads image first, sends as pure base64."""
+        import base64
+        req = urllib.request.Request(image_url, headers={"User-Agent": "kavita-bangumi-sync/1.0"})
+        resp = urllib.request.urlopen(req, timeout=15)
+        img_data = resp.read()
+        b64 = base64.b64encode(img_data).decode()
+        # Kavita expects pure base64 string, no data:xxx;base64, prefix
+        body = {"id": series_id, "url": b64, "lockCover": True}
+        return self._request("POST", "/api/upload/series", body)
+
+    def upload_chapter_cover(self, chapter_id, image_url):
+        """Upload a cover image for a chapter/volume."""
+        import base64
+        req = urllib.request.Request(image_url, headers={"User-Agent": "kavita-bangumi-sync/1.0"})
+        resp = urllib.request.urlopen(req, timeout=15)
+        img_data = resp.read()
+        b64 = base64.b64encode(img_data).decode()
+        body = {"id": chapter_id, "url": b64, "lockCover": True}
+        return self._request("POST", "/api/upload/chapter", body)
+
     def update_series_metadata(self, metadata_dto):
         """Update series metadata."""
         body = {"seriesMetadata": metadata_dto}
@@ -140,16 +170,38 @@ class BangumiClient:
         cleaned = re.sub(r'[-\s]*(?:TW|JP|HK)$', '', cleaned)
         # Remove format/resolution tags: 8K重排版, 重排版
         cleaned = re.sub(r'\s*\d*[Kk]?重排版$', '', cleaned)
-        # Remove edition tags at end: -愛藏版, 愛藏版
-        cleaned = re.sub(r'[-\s]*愛藏版$', '', cleaned)
+        # Remove edition/format suffixes at end
+        cleaned = re.sub(r'[-\s]*(?:愛藏版|爱藏版|典藏版|完全版|新装版|新裝版|数码全彩|全彩)$', '', cleaned)
         # Remove trailing arc/part names: 公安篇, XX篇 (without parens)
         cleaned = re.sub(r'\s+\S*篇$', '', cleaned)
         return cleaned.strip()
 
-    def search(self, title):
-        """Search Bangumi for a manga by title. Returns best match or None."""
-        # Try original title first, then cleaned version
-        for query in dict.fromkeys([title, self.clean_title(title)]):
+    @staticmethod
+    def normalize(text):
+        """统一转简体 + 全角标点转半角 + 去末尾标点，用于比较。"""
+        s = to_simplified(text)
+        # 全角标点 → 半角
+        s = s.translate(str.maketrans(
+            "\uff01\uff1f\u3002\uff0c\u3001\uff1b\uff1a\u201c\u201d\u2018\u2019\uff08\uff09\u3010\u3011",
+            '!?.,,;:""' + "''" + "()[]",
+        ))
+        # 去末尾标点
+        s = re.sub(r'[!?.\s]+$', '', s)
+        return s
+
+    def search(self, title, strict=False):
+        """Search Bangumi for a manga by title. Returns (match, confidence) or (None, None).
+
+        confidence: "exact", "partial", "first" (only when not strict)
+        In strict mode, "first" results are skipped (returns None).
+        """
+        # 统一转简体后搜索，去重保留顺序
+        s_title = to_simplified(title)
+        s_cleaned = to_simplified(self.clean_title(title))
+        # 去掉末尾标点（Bangumi 搜索对 ! ? 等敏感）
+        s_stripped = re.sub(r'[!?！？。.~～]+$', '', s_title)
+        queries = dict.fromkeys([s_title, s_cleaned, s_stripped])
+        for query in queries:
             if not query:
                 continue
             encoded = urllib.parse.quote(query)
@@ -159,27 +211,57 @@ class BangumiClient:
                 continue
 
             candidates = data["list"]
-            # Prefer exact name_cn match
-            for item in candidates:
-                if item.get("name_cn") == query:
-                    return item
-            # Partial match — pick the one with most ratings (most popular)
-            partial = [
-                item for item in candidates
-                if item.get("name_cn") and
-                   (query in item["name_cn"] or item["name_cn"] in query)
-            ]
-            if partial:
-                return max(partial, key=lambda x: x.get("rating", {}).get("total", 0))
-            # First result
-            return candidates[0]
+            query_n = self.normalize(query)
 
-        return None
+            # Prefer exact match (normalized)
+            for item in candidates:
+                cn_n = self.normalize(item.get("name_cn", ""))
+                if cn_n == query_n:
+                    return item, "exact"
+
+            # Partial match — normalized comparison
+            partial = []
+            for item in candidates:
+                cn_n = self.normalize(item.get("name_cn", ""))
+                if not cn_n:
+                    continue
+                if query_n in cn_n or cn_n in query_n:
+                    # Reject short queries (< 3 chars)
+                    if len(query_n) < 3:
+                        continue
+                    # When query is substring of result, only accept prefix/suffix
+                    if query_n in cn_n and cn_n not in query_n:
+                        if not (cn_n.startswith(query_n) or cn_n.endswith(query_n)):
+                            continue
+                    partial.append(item)
+            if partial:
+                return max(partial, key=lambda x: x.get("rating", {}).get("total", 0)), "partial"
+
+            # First result — low confidence
+            if not strict:
+                return candidates[0], "first"
+
+        return None, None
 
     def get_subject(self, subject_id):
         """Get detailed subject info including tags."""
         url = f"{self.base_url}/v0/subjects/{subject_id}"
         return self._get(url)
+
+    def get_volumes(self, subject_id):
+        """Get list of related 单行本 (volumes) for a subject, sorted by volume number."""
+        url = f"{self.base_url}/v0/subjects/{subject_id}/subjects"
+        data = self._get(url)
+        if not data:
+            return []
+        volumes = [item for item in data if item.get("relation") == "单行本"]
+        # Sort by volume number extracted from name like "大ダーク (1)"
+        def vol_num(item):
+            name = item.get("name", "") or item.get("name_cn", "")
+            m = re.search(r'\((\d+)\)', name)
+            return int(m.group(1)) if m else 0
+        volumes.sort(key=vol_num)
+        return volumes
 
 
 # ─── Metadata Mapping ───────────────────────────────────────────────────────
@@ -218,18 +300,34 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
         meta["summary"] = enhanced_summary
         meta["summaryLocked"] = True
 
-    # Tags from Bangumi
+    # Tags from Bangumi (filtered)
     if bgm_detail and (force or not meta.get("tagsLocked")):
         bgm_tags = bgm_detail.get("tags", [])
-        # Take top 10 tags by count
-        top_tags = sorted(bgm_tags, key=lambda t: t.get("count", 0), reverse=True)[:10]
+        # Filter out noise tags: years, publisher names, meta tags
+        noise_patterns = re.compile(
+            r'^\d{4}$'           # 年份 like "2019"
+            r'|^漫画$|^漫画系列$|^manga$'
+            r'|^日本$|^中国$'
+            r'|^集英社$|^講談社$|^小學館$|^角川$|^スクエニ$'
+            r'|^少年漫画$|^少女漫画$|^青年漫画$'
+            r'|^已完结$|^连载中$',
+            re.IGNORECASE
+        )
+        filtered = [t for t in bgm_tags if not noise_patterns.match(t.get("name", ""))]
+        top_tags = sorted(filtered, key=lambda t: t.get("count", 0), reverse=True)[:10]
         if top_tags:
-            existing_tags = meta.get("tags", [])
-            existing_names = {t.get("title", "").lower() for t in existing_tags}
+            # When forcing, start fresh to remove old noise tags
+            existing_tags = [] if force else meta.get("tags", [])
+            # Match Kavita's normalization: keep \p{L} + 0-9 + special, lowercase
+            _keep = set('+!＊！＋')
+            def _norm_tag(s):
+                return ''.join(c for c in s if c.isalpha() or c.isdigit() or c in _keep).lower()
+            existing_names = {_norm_tag(t.get("title", "")) for t in existing_tags}
             for tag in top_tags:
                 tag_name = tag.get("name", "")
-                if tag_name.lower() not in existing_names:
+                if _norm_tag(tag_name) not in existing_names:
                     existing_tags.append({"id": 0, "title": tag_name})
+                    existing_names.add(_norm_tag(tag_name))
             meta["tags"] = existing_tags
             meta["tagsLocked"] = False
 
@@ -241,6 +339,36 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
             genres = meta.get("genres", [])
             genres.append({"id": 0, "title": bgm_type})
             meta["genres"] = genres
+
+    # Release year
+    if bgm_detail and (force or not meta.get("releaseYear")):
+        date_str = bgm_detail.get("date", "")
+        if date_str:
+            try:
+                meta["releaseYear"] = int(date_str[:4])
+            except (ValueError, IndexError):
+                pass
+
+    # Publication status from infobox
+    if bgm_detail and (force or not meta.get("publicationStatusLocked")):
+        infobox = bgm_detail.get("infobox", [])
+        end_date = None
+        for info in infobox:
+            if info.get("key") == "结束":
+                end_date = info.get("value")
+                break
+        # publicationStatus: 0=Ongoing, 1=Hiatus, 2=Completed, 3=Cancelled, 4=Ended
+        if end_date:
+            meta["publicationStatus"] = 2  # Completed
+        else:
+            meta["publicationStatus"] = 0  # Ongoing
+        meta["publicationStatusLocked"] = True
+
+    # Age rating from nsfw flag
+    if bgm_detail:
+        if bgm_detail.get("nsfw"):
+            meta["ageRating"] = 4  # X18+
+            meta["ageRatingLocked"] = True
 
     # WebLinks - add/replace Bangumi link
     if bgm_id:
@@ -294,6 +422,9 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="预览模式，不写入")
     parser.add_argument("--series", type=str, help="只同步指定名称的系列")
     parser.add_argument("--force", action="store_true", help="即使已有摘要也强制覆盖")
+    parser.add_argument("--strict", action="store_true", help="只写入精确/部分匹配，跳过低置信度结果")
+    parser.add_argument("--cover", action="store_true", help="用 Bangumi 封面替换指定系列的封面（需配合 --series）")
+    parser.add_argument("--cover-volumes", action="store_true", help="用 Bangumi 单行本封面替换每卷封面（需配合 --series）")
     args = parser.parse_args()
 
     config = load_config()
@@ -306,6 +437,125 @@ def main():
     overrides = load_overrides()
     if overrides:
         print(f"已加载 {len(overrides)} 条手动映射")
+
+    # --cover mode: replace cover with Bangumi image
+    if args.cover:
+        if not args.series:
+            print("错误: --cover 需要配合 --series 使用")
+            sys.exit(1)
+
+        all_series = kavita.get_all_series()
+        matches = [s for s in all_series if args.series in s.get("name", "")]
+        if not matches:
+            print(f"未找到匹配 \"{args.series}\" 的系列")
+            sys.exit(1)
+
+        for series in matches:
+            name = series.get("name", "")
+            sid = series["id"]
+            print(f"[封面] {name}", end="")
+
+            # Find Bangumi match
+            override_id = overrides.get(name)
+            if override_id:
+                bgm_detail = bangumi.get_subject(override_id)
+                images = bgm_detail.get("images", {}) if bgm_detail else {}
+            else:
+                bgm_result, conf = bangumi.search(name, strict=True)
+                if not bgm_result:
+                    print(f" → Bangumi 未找到")
+                    continue
+                bgm_detail = bangumi.get_subject(bgm_result["id"])
+                images = bgm_detail.get("images", {}) if bgm_detail else bgm_result.get("images", {})
+
+            cover_url = images.get("large") or images.get("common")
+            if not cover_url:
+                print(f" → 无封面图")
+                continue
+
+            if args.dry_run:
+                print(f" → {cover_url} [DRY RUN]")
+                continue
+
+            try:
+                kavita.upload_series_cover(sid, cover_url)
+                print(f" ✓ 封面已更新")
+            except Exception as e:
+                print(f" ✗ {e}")
+
+        return
+
+    # --cover-volumes mode: replace each volume cover with Bangumi 单行本 image
+    if args.cover_volumes:
+        if not args.series:
+            print("错误: --cover-volumes 需要配合 --series 使用")
+            sys.exit(1)
+
+        all_series = kavita.get_all_series()
+        matches = [s for s in all_series if args.series in s.get("name", "")]
+        if not matches:
+            print(f"未找到匹配 \"{args.series}\" 的系列")
+            sys.exit(1)
+
+        for series in matches:
+            name = series.get("name", "")
+            sid = series["id"]
+            print(f"[卷封面] {name}")
+
+            # Find Bangumi subject id
+            override_id = overrides.get(name)
+            if override_id:
+                bgm_id = override_id
+            else:
+                bgm_result, conf = bangumi.search(name, strict=True)
+                if not bgm_result:
+                    print(f"  → Bangumi 未找到")
+                    continue
+                bgm_id = bgm_result["id"]
+
+            # Get 单行本 list from Bangumi
+            bgm_volumes = bangumi.get_volumes(bgm_id)
+            if not bgm_volumes:
+                print(f"  → Bangumi 没有单行本数据")
+                continue
+
+            # Get Kavita volumes
+            kavita_volumes = kavita._request("GET", f"/api/series/volumes?seriesId={sid}")
+            kavita_volumes = sorted(kavita_volumes, key=lambda v: int(v.get("name", 0)) if v.get("name", "").isdigit() else 0)
+
+            print(f"  Bangumi 卷数: {len(bgm_volumes)}, Kavita 卷数: {len(kavita_volumes)}")
+
+            for i, kv in enumerate(kavita_volumes):
+                if i >= len(bgm_volumes):
+                    break
+                bv = bgm_volumes[i]
+                # Fetch detail to get cover
+                bv_detail = bangumi.get_subject(bv["id"])
+                if not bv_detail:
+                    continue
+                images = bv_detail.get("images", {})
+                cover_url = images.get("large") or images.get("common")
+                if not cover_url:
+                    print(f"  Vol.{kv.get('name')} → 无封面")
+                    continue
+
+                # Use chapter id to upload (each volume has one chapter)
+                chapters = kv.get("chapters", [])
+                if not chapters:
+                    continue
+                chapter_id = chapters[0]["id"]
+
+                if args.dry_run:
+                    print(f"  Vol.{kv.get('name')} ← {bv.get('name')} [DRY RUN]")
+                    continue
+
+                try:
+                    kavita.upload_chapter_cover(chapter_id, cover_url)
+                    print(f"  Vol.{kv.get('name')} ✓ ← {bv.get('name')}")
+                except Exception as e:
+                    print(f"  Vol.{kv.get('name')} ✗ {e}")
+
+        return
 
     # Get all series
     print("\n获取 Kavita 系列列表...")
@@ -361,11 +611,13 @@ def main():
                 print(f" [映射]", end="")
 
         if not bgm_result:
-            bgm_result = bangumi.search(name)
+            bgm_result, confidence = bangumi.search(name, strict=args.strict)
+        else:
+            confidence = "override"
 
         # If not found, try localized name
         if not bgm_result and localized and localized != name:
-            bgm_result = bangumi.search(localized)
+            bgm_result, confidence = bangumi.search(localized, strict=args.strict)
 
         if not bgm_result:
             print(f" → Bangumi 未找到")
@@ -376,7 +628,8 @@ def main():
         bgm_cn = bgm_result.get("name_cn", "")
         bgm_score = bgm_result.get("rating", {}).get("score", "—")
         bgm_id = bgm_result.get("id")
-        print(f" → {bgm_cn} (评分: {bgm_score})", end="")
+        conf_tag = f" [{confidence}]" if confidence != "exact" else ""
+        print(f" → {bgm_cn} (评分: {bgm_score}){conf_tag}", end="")
 
         # Get detailed info
         bgm_detail = bangumi.get_subject(bgm_id) if bgm_id else None
