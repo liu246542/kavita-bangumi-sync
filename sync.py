@@ -429,6 +429,28 @@ def _vol_sort_key(v):
     return int(name) if name.isdigit() else 0
 
 
+def _print_review_summary(results):
+    """Highlight entries that need manual verification:
+    - first-confidence matches (Bangumi's top search hit, semantically unchecked)
+    - not_found entries (no match at all — candidate for overrides.json)
+    """
+    first_matches = [r for r in results if r.get("confidence") == "first"]
+    not_found = [r for r in results if r.get("status") == "not_found"]
+
+    if not first_matches and not not_found:
+        return
+
+    print(f"\n需要人工核对:")
+    for r in first_matches:
+        print(f"  ⚠ 低置信度  {r['name']}")
+        print(f"              → {r.get('bgm_name', '')}  {r.get('bgm_url', '')}")
+    for r in not_found:
+        print(f"  ? 未找到    {r['name']}")
+
+    print(f"\n  不对/未找到的条目，手动在 Bangumi 查到 subject id 后加入 overrides.json，")
+    print(f"  然后用 --force --series \"<名称>\" 单独重跑该条。")
+
+
 def _do_cover_update(args, kavita, bangumi, overrides):
     """Handle --cover and/or --cover-volumes. Both share the Bangumi lookup."""
     if not args.series:
@@ -578,26 +600,35 @@ def _do_metadata_sync(args, kavita, bangumi, overrides):
             print(f" [映射]", end="")
         bgm_cn = bgm_result.get("name_cn", "")
         bgm_score = bgm_result.get("rating", {}).get("score", "—")
+        bgm_id_val = bgm_result.get("id")
         conf_tag = f" [{confidence}]" if confidence not in ("exact", "override") else ""
         print(f" → {bgm_cn} (评分: {bgm_score}){conf_tag}", end="")
 
         updated_meta = map_bangumi_to_kavita(bgm_result, bgm_detail, meta, force=args.force)
 
+        entry = {
+            "name": name,
+            "bgm_name": bgm_cn,
+            "bgm_id": bgm_id_val,
+            "bgm_url": f"https://bgm.tv/subject/{bgm_id_val}" if bgm_id_val else None,
+            "confidence": confidence,
+            "score": bgm_score,
+        }
         if args.dry_run:
             print(f" [DRY RUN]")
-            results.append({"name": name, "status": "would_update",
-                            "bgm_name": bgm_cn, "score": bgm_score})
+            entry["status"] = "would_update"
         else:
             try:
                 kavita.update_series_metadata(updated_meta)
                 print(f" ✓")
                 stats["updated"] += 1
-                results.append({"name": name, "status": "updated",
-                                "bgm_name": bgm_cn, "score": bgm_score})
+                entry["status"] = "updated"
             except Exception as e:
                 print(f" ✗ 更新失败: {e}")
                 stats["error"] += 1
-                results.append({"name": name, "status": "error", "error": str(e)})
+                entry["status"] = "error"
+                entry["error"] = str(e)
+        results.append(entry)
 
     print(f"\n{'='*60}")
     print(f"完成!")
@@ -605,6 +636,8 @@ def _do_metadata_sync(args, kavita, bangumi, overrides):
     print(f"  跳过: {stats['skipped']}")
     print(f"  未找到: {stats['not_found']}")
     print(f"  错误: {stats['error']}")
+
+    _print_review_summary(results)
 
     # Preserve the last real sync's audit record when doing a dry-run
     if args.dry_run:
@@ -616,6 +649,18 @@ def _do_metadata_sync(args, kavita, bangumi, overrides):
         print(f"\n详细结果已保存到 {results_path}")
 
 
+def _do_review():
+    """Read last_sync_results.json and print the review summary, no network."""
+    results_path = Path(__file__).parent / "last_sync_results.json"
+    if not results_path.exists():
+        print(f"没有 {results_path.name}，请先运行一次 sync")
+        sys.exit(1)
+    with open(results_path) as f:
+        results = json.load(f)
+    print(f"读取 {len(results)} 条结果 from {results_path.name}")
+    _print_review_summary(results)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync Bangumi metadata to Kavita")
     parser.add_argument("--dry-run", action="store_true", help="预览模式，不写入")
@@ -624,7 +669,12 @@ def main():
     parser.add_argument("--strict", action="store_true", help="只写入精确/部分匹配，跳过低置信度结果")
     parser.add_argument("--cover", action="store_true", help="用 Bangumi 封面替换指定系列的封面（需配合 --series）")
     parser.add_argument("--cover-volumes", action="store_true", help="用 Bangumi 单行本封面替换每卷封面（需配合 --series）")
+    parser.add_argument("--review", action="store_true", help="读取上次同步结果，列出需人工核对的条目（不请求网络）")
     args = parser.parse_args()
+
+    if args.review:
+        _do_review()
+        return
 
     config = load_config()
     kavita = KavitaClient(config["kavita"]["base_url"],
