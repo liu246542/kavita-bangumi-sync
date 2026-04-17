@@ -429,6 +429,23 @@ def _vol_sort_key(v):
     return int(name) if name.isdigit() else 0
 
 
+def _filter_to_overrides(all_series, overrides):
+    """Keep only series whose name is an overrides.json key.
+
+    Warn about override keys that don't match any Kavita series — these are
+    usually typos or series that were renamed on the Kavita side.
+    """
+    override_names = set(overrides.keys())
+    kavita_names = {s.get("name", "") for s in all_series}
+    missing = sorted(override_names - kavita_names)
+    if missing:
+        print(f"\n⚠ overrides.json 中有 {len(missing)} 条未在 Kavita 中找到对应系列:")
+        for name in missing:
+            print(f"  - {name}")
+        print(f"  (可能是拼写错误，或 Kavita 里已重命名；这些条目会被跳过)")
+    return [s for s in all_series if s.get("name", "") in override_names]
+
+
 def _print_review_summary(results):
     """Highlight entries that need manual verification:
     - first-confidence matches (Bangumi's top search hit, semantically unchecked)
@@ -560,9 +577,13 @@ def _do_metadata_sync(args, kavita, bangumi, overrides):
     all_series = kavita.get_all_series()
     print(f"共 {len(all_series)} 个系列")
 
+    if args.overrides_only:
+        all_series = _filter_to_overrides(all_series, overrides)
+        print(f"overrides 过滤后: {len(all_series)} 个")
+
     if args.series:
         all_series = [s for s in all_series if args.series in s.get("name", "")]
-        print(f"筛选后: {len(all_series)} 个")
+        print(f"--series 筛选后: {len(all_series)} 个")
 
     stats = {"updated": 0, "skipped": 0, "not_found": 0, "error": 0}
     results = []
@@ -670,11 +691,16 @@ def main():
     parser.add_argument("--cover", action="store_true", help="用 Bangumi 封面替换指定系列的封面（需配合 --series）")
     parser.add_argument("--cover-volumes", action="store_true", help="用 Bangumi 单行本封面替换每卷封面（需配合 --series）")
     parser.add_argument("--review", action="store_true", help="读取上次同步结果，列出需人工核对的条目（不请求网络）")
+    parser.add_argument("--overrides-only", action="store_true", help="只同步 overrides.json 里列出的系列（适合批量修正误匹配）")
     args = parser.parse_args()
 
     if args.review:
         _do_review()
         return
+
+    if args.overrides_only and (args.cover or args.cover_volumes):
+        print("错误: --overrides-only 只用于元数据同步，不能与 --cover / --cover-volumes 组合")
+        sys.exit(1)
 
     config = load_config()
     kavita = KavitaClient(config["kavita"]["base_url"],
@@ -686,6 +712,10 @@ def main():
     overrides = load_overrides()
     if overrides:
         print(f"已加载 {len(overrides)} 条手动映射")
+
+    if args.overrides_only and not overrides:
+        print("错误: --overrides-only 需要非空的 overrides.json")
+        sys.exit(1)
 
     if args.cover or args.cover_volumes:
         _do_cover_update(args, kavita, bangumi, overrides)
