@@ -108,6 +108,10 @@ class KavitaClient:
         """Get metadata for a specific series."""
         return self._request("GET", f"/api/series/metadata?seriesId={series_id}")
 
+    def get_volumes(self, series_id):
+        """Get all volumes (with chapters) for a series."""
+        return self._request("GET", f"/api/series/volumes?seriesId={series_id}")
+
     def _fetch_image_b64(self, image_url):
         req = urllib.request.Request(image_url, headers={"User-Agent": "kavita-bangumi-sync/1.0"})
         resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
@@ -265,6 +269,18 @@ class BangumiClient:
 
 # ─── Metadata Mapping ───────────────────────────────────────────────────────
 
+# Bangumi tags that don't help readers (years, publishers, meta categories)
+_NOISE_TAG_RE = re.compile(
+    r'^\d{4}$'
+    r'|^漫画$|^漫画系列$|^manga$'
+    r'|^日本$|^中国$'
+    r'|^集英社$|^講談社$|^小學館$|^角川$|^スクエニ$'
+    r'|^少年漫画$|^少女漫画$|^青年漫画$'
+    r'|^已完结$|^连载中$',
+    re.IGNORECASE,
+)
+
+
 def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False):
     """Map Bangumi data to Kavita's SeriesMetadataDto format."""
     meta = existing_metadata.copy()
@@ -276,8 +292,6 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
 
     score = bgm_search.get("rating", {}).get("score")
     rank = bgm_search.get("rank")
-    name_jp = bgm_search.get("name", "")
-    name_cn = bgm_search.get("name_cn", "")
     bgm_id = bgm_search.get("id")
 
     # Build enhanced summary
@@ -302,17 +316,7 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
     # Tags from Bangumi (filtered)
     if bgm_detail and (force or not meta.get("tagsLocked")):
         bgm_tags = bgm_detail.get("tags", [])
-        # Filter out noise tags: years, publisher names, meta tags
-        noise_patterns = re.compile(
-            r'^\d{4}$'           # 年份 like "2019"
-            r'|^漫画$|^漫画系列$|^manga$'
-            r'|^日本$|^中国$'
-            r'|^集英社$|^講談社$|^小學館$|^角川$|^スクエニ$'
-            r'|^少年漫画$|^少女漫画$|^青年漫画$'
-            r'|^已完结$|^连载中$',
-            re.IGNORECASE
-        )
-        filtered = [t for t in bgm_tags if not noise_patterns.match(t.get("name", ""))]
+        filtered = [t for t in bgm_tags if not _NOISE_TAG_RE.match(t.get("name", ""))]
         top_tags = sorted(filtered, key=lambda t: t.get("count", 0), reverse=True)[:10]
         if top_tags:
             # When forcing, start fresh to remove old noise tags
@@ -420,6 +424,198 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
+def _vol_sort_key(v):
+    name = v.get("name", "")
+    return int(name) if name.isdigit() else 0
+
+
+def _do_cover_update(args, kavita, bangumi, overrides):
+    """Handle --cover and/or --cover-volumes. Both share the Bangumi lookup."""
+    if not args.series:
+        print("错误: --cover / --cover-volumes 需要配合 --series 使用")
+        sys.exit(1)
+
+    matches = [s for s in kavita.get_all_series() if args.series in s.get("name", "")]
+    if not matches:
+        print(f"未找到匹配 \"{args.series}\" 的系列")
+        sys.exit(1)
+
+    for series in matches:
+        name = series.get("name", "")
+        sid = series["id"]
+        print(f"[{name}]")
+
+        # Resolve Bangumi subject id (override takes precedence over strict search)
+        override_id = overrides.get(name)
+        if override_id:
+            bgm_id = override_id
+        else:
+            bgm_result, _ = bangumi.search(name, strict=True)
+            if not bgm_result:
+                print(f"  → Bangumi 未找到")
+                continue
+            bgm_id = bgm_result["id"]
+
+        bgm_detail = bangumi.get_subject(bgm_id)
+
+        if args.cover:
+            images = bgm_detail.get("images", {}) if bgm_detail else {}
+            cover_url = images.get("large") or images.get("common")
+            if not cover_url:
+                print(f"  [封面] 无封面图")
+            elif args.dry_run:
+                print(f"  [封面] → {cover_url} [DRY RUN]")
+            else:
+                try:
+                    kavita.upload_series_cover(sid, cover_url)
+                    print(f"  [封面] ✓ 已更新")
+                except Exception as e:
+                    print(f"  [封面] ✗ {e}")
+
+        if args.cover_volumes:
+            bgm_volumes = bangumi.get_volumes(bgm_id)
+            if not bgm_volumes:
+                print(f"  [卷封面] Bangumi 没有单行本数据")
+                continue
+
+            kavita_volumes = sorted(kavita.get_volumes(sid), key=_vol_sort_key)
+            print(f"  [卷封面] Bangumi {len(bgm_volumes)} 卷, Kavita {len(kavita_volumes)} 卷")
+
+            for i, kv in enumerate(kavita_volumes):
+                if i >= len(bgm_volumes):
+                    break
+                bv = bgm_volumes[i]
+                bv_detail = bangumi.get_subject(bv["id"])
+                if not bv_detail:
+                    continue
+                images = bv_detail.get("images", {})
+                cover_url = images.get("large") or images.get("common")
+                if not cover_url:
+                    print(f"    Vol.{kv.get('name')} → 无封面")
+                    continue
+
+                chapters = kv.get("chapters", [])
+                if not chapters:
+                    continue
+                chapter_id = chapters[0]["id"]
+
+                if args.dry_run:
+                    print(f"    Vol.{kv.get('name')} ← {bv.get('name')} [DRY RUN]")
+                    continue
+
+                try:
+                    kavita.upload_chapter_cover(chapter_id, cover_url)
+                    print(f"    Vol.{kv.get('name')} ✓ ← {bv.get('name')}")
+                except Exception as e:
+                    print(f"    Vol.{kv.get('name')} ✗ {e}")
+
+
+def _resolve_bangumi(name, localized, overrides, bangumi, strict):
+    """Return (bgm_result, bgm_detail, confidence) or (None, None, None).
+
+    Override path fetches get_subject once and reuses it as both summary
+    and detail — the v0 endpoint is a superset of what search returns.
+    """
+    override_id = overrides.get(name)
+    if override_id:
+        detail = bangumi.get_subject(override_id)
+        if detail:
+            return detail, detail, "override"
+
+    result, confidence = bangumi.search(name, strict=strict)
+    if not result and localized and localized != name:
+        result, confidence = bangumi.search(localized, strict=strict)
+    if not result:
+        return None, None, None
+
+    detail = bangumi.get_subject(result["id"]) if result.get("id") else None
+    return result, detail, confidence
+
+
+def _do_metadata_sync(args, kavita, bangumi, overrides):
+    """Default metadata sync flow over all (or --series-filtered) Kavita series."""
+    print("\n获取 Kavita 系列列表...")
+    all_series = kavita.get_all_series()
+    print(f"共 {len(all_series)} 个系列")
+
+    if args.series:
+        all_series = [s for s in all_series if args.series in s.get("name", "")]
+        print(f"筛选后: {len(all_series)} 个")
+
+    stats = {"updated": 0, "skipped": 0, "not_found": 0, "error": 0}
+    results = []
+
+    for i, series in enumerate(all_series):
+        sid = series["id"]
+        name = series.get("name", "")
+        localized = series.get("localizedName", "")
+
+        print(f"\n[{i+1}/{len(all_series)}] {name}", end="")
+
+        try:
+            meta = kavita.get_series_metadata(sid)
+        except Exception as e:
+            print(f" ✗ 获取元数据失败: {e}")
+            stats["error"] += 1
+            continue
+
+        # Skip already-synced series (bgm.tv link in webLinks is the reliable marker)
+        if not args.force and "bgm.tv" in (meta.get("webLinks") or ""):
+            print(f" → 已有 Bangumi 数据，跳过")
+            stats["skipped"] += 1
+            continue
+
+        bgm_result, bgm_detail, confidence = _resolve_bangumi(
+            name, localized, overrides, bangumi, strict=args.strict
+        )
+        if not bgm_result:
+            print(f" → Bangumi 未找到")
+            stats["not_found"] += 1
+            results.append({"name": name, "status": "not_found"})
+            continue
+
+        if confidence == "override":
+            print(f" [映射]", end="")
+        bgm_cn = bgm_result.get("name_cn", "")
+        bgm_score = bgm_result.get("rating", {}).get("score", "—")
+        conf_tag = f" [{confidence}]" if confidence not in ("exact", "override") else ""
+        print(f" → {bgm_cn} (评分: {bgm_score}){conf_tag}", end="")
+
+        updated_meta = map_bangumi_to_kavita(bgm_result, bgm_detail, meta, force=args.force)
+
+        if args.dry_run:
+            print(f" [DRY RUN]")
+            results.append({"name": name, "status": "would_update",
+                            "bgm_name": bgm_cn, "score": bgm_score})
+        else:
+            try:
+                kavita.update_series_metadata(updated_meta)
+                print(f" ✓")
+                stats["updated"] += 1
+                results.append({"name": name, "status": "updated",
+                                "bgm_name": bgm_cn, "score": bgm_score})
+            except Exception as e:
+                print(f" ✗ 更新失败: {e}")
+                stats["error"] += 1
+                results.append({"name": name, "status": "error", "error": str(e)})
+
+    print(f"\n{'='*60}")
+    print(f"完成!")
+    print(f"  更新: {stats['updated']}")
+    print(f"  跳过: {stats['skipped']}")
+    print(f"  未找到: {stats['not_found']}")
+    print(f"  错误: {stats['error']}")
+
+    # Preserve the last real sync's audit record when doing a dry-run
+    if args.dry_run:
+        print(f"\n[DRY RUN] 未写入 last_sync_results.json")
+    else:
+        results_path = Path(__file__).parent / "last_sync_results.json"
+        with open(results_path, "w") as f:
+            json.dump(results, f, ensure_ascii=False, indent=2)
+        print(f"\n详细结果已保存到 {results_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Sync Bangumi metadata to Kavita")
     parser.add_argument("--dry-run", action="store_true", help="预览模式，不写入")
@@ -431,218 +627,20 @@ def main():
     args = parser.parse_args()
 
     config = load_config()
-    kc = config["kavita"]
-    bc = config["bangumi"]
-
-    # Init clients
-    kavita = KavitaClient(kc["base_url"], kc["username"], kc["password"])
-    bangumi = BangumiClient(bc["base_url"], bc["user_agent"], bc.get("rate_limit_delay", 0.4))
+    kavita = KavitaClient(config["kavita"]["base_url"],
+                          config["kavita"]["username"],
+                          config["kavita"]["password"])
+    bangumi = BangumiClient(config["bangumi"]["base_url"],
+                            config["bangumi"]["user_agent"],
+                            config["bangumi"].get("rate_limit_delay", 0.4))
     overrides = load_overrides()
     if overrides:
         print(f"已加载 {len(overrides)} 条手动映射")
 
-    # Cover modes: --cover updates series cover, --cover-volumes updates each volume cover.
-    # Both can be combined in a single run — they share the Bangumi lookup.
     if args.cover or args.cover_volumes:
-        if not args.series:
-            print("错误: --cover / --cover-volumes 需要配合 --series 使用")
-            sys.exit(1)
-
-        all_series = kavita.get_all_series()
-        matches = [s for s in all_series if args.series in s.get("name", "")]
-        if not matches:
-            print(f"未找到匹配 \"{args.series}\" 的系列")
-            sys.exit(1)
-
-        for series in matches:
-            name = series.get("name", "")
-            sid = series["id"]
-            print(f"[{name}]")
-
-            # Resolve Bangumi subject id once (override takes precedence, else strict search)
-            override_id = overrides.get(name)
-            if override_id:
-                bgm_id = override_id
-            else:
-                bgm_result, _ = bangumi.search(name, strict=True)
-                if not bgm_result:
-                    print(f"  → Bangumi 未找到")
-                    continue
-                bgm_id = bgm_result["id"]
-
-            bgm_detail = bangumi.get_subject(bgm_id)
-
-            if args.cover:
-                images = bgm_detail.get("images", {}) if bgm_detail else {}
-                cover_url = images.get("large") or images.get("common")
-                if not cover_url:
-                    print(f"  [封面] 无封面图")
-                elif args.dry_run:
-                    print(f"  [封面] → {cover_url} [DRY RUN]")
-                else:
-                    try:
-                        kavita.upload_series_cover(sid, cover_url)
-                        print(f"  [封面] ✓ 已更新")
-                    except Exception as e:
-                        print(f"  [封面] ✗ {e}")
-
-            if args.cover_volumes:
-                bgm_volumes = bangumi.get_volumes(bgm_id)
-                if not bgm_volumes:
-                    print(f"  [卷封面] Bangumi 没有单行本数据")
-                    continue
-
-                kavita_volumes = kavita._request("GET", f"/api/series/volumes?seriesId={sid}")
-                kavita_volumes = sorted(
-                    kavita_volumes,
-                    key=lambda v: int(v.get("name", 0)) if v.get("name", "").isdigit() else 0,
-                )
-                print(f"  [卷封面] Bangumi {len(bgm_volumes)} 卷, Kavita {len(kavita_volumes)} 卷")
-
-                for i, kv in enumerate(kavita_volumes):
-                    if i >= len(bgm_volumes):
-                        break
-                    bv = bgm_volumes[i]
-                    bv_detail = bangumi.get_subject(bv["id"])
-                    if not bv_detail:
-                        continue
-                    images = bv_detail.get("images", {})
-                    cover_url = images.get("large") or images.get("common")
-                    if not cover_url:
-                        print(f"    Vol.{kv.get('name')} → 无封面")
-                        continue
-
-                    chapters = kv.get("chapters", [])
-                    if not chapters:
-                        continue
-                    chapter_id = chapters[0]["id"]
-
-                    if args.dry_run:
-                        print(f"    Vol.{kv.get('name')} ← {bv.get('name')} [DRY RUN]")
-                        continue
-
-                    try:
-                        kavita.upload_chapter_cover(chapter_id, cover_url)
-                        print(f"    Vol.{kv.get('name')} ✓ ← {bv.get('name')}")
-                    except Exception as e:
-                        print(f"    Vol.{kv.get('name')} ✗ {e}")
-
-        return
-
-    # Get all series
-    print("\n获取 Kavita 系列列表...")
-    all_series = kavita.get_all_series()
-    print(f"共 {len(all_series)} 个系列")
-
-    if args.series:
-        all_series = [s for s in all_series if args.series in s.get("name", "")]
-        print(f"筛选后: {len(all_series)} 个")
-
-    # Process each series
-    stats = {"updated": 0, "skipped": 0, "not_found": 0, "error": 0}
-    results = []
-
-    for i, series in enumerate(all_series):
-        sid = series["id"]
-        name = series.get("name", "")
-        localized = series.get("localizedName", "")
-
-        print(f"\n[{i+1}/{len(all_series)}] {name}", end="")
-
-        # Get existing metadata
-        try:
-            meta = kavita.get_series_metadata(sid)
-        except Exception as e:
-            print(f" ✗ 获取元数据失败: {e}")
-            stats["error"] += 1
-            continue
-
-        # Skip if this series has already been synced (bgm.tv link is the reliable marker)
-        if not args.force and "bgm.tv" in (meta.get("webLinks") or ""):
-            print(f" → 已有 Bangumi 数据，跳过")
-            stats["skipped"] += 1
-            continue
-
-        # Check overrides first, then search Bangumi
-        override_id = overrides.get(name)
-        bgm_result = None
-        if override_id:
-            # Direct lookup by Bangumi ID
-            bgm_detail_direct = bangumi.get_subject(override_id)
-            if bgm_detail_direct:
-                bgm_result = {
-                    "id": override_id,
-                    "name_cn": bgm_detail_direct.get("name_cn", ""),
-                    "name": bgm_detail_direct.get("name", ""),
-                    "rating": bgm_detail_direct.get("rating", {}),
-                    "rank": bgm_detail_direct.get("rank"),
-                    "summary": bgm_detail_direct.get("summary", ""),
-                }
-                print(f" [映射]", end="")
-
-        if not bgm_result:
-            bgm_result, confidence = bangumi.search(name, strict=args.strict)
-        else:
-            confidence = "override"
-
-        # If not found, try localized name
-        if not bgm_result and localized and localized != name:
-            bgm_result, confidence = bangumi.search(localized, strict=args.strict)
-
-        if not bgm_result:
-            print(f" → Bangumi 未找到")
-            stats["not_found"] += 1
-            results.append({"name": name, "status": "not_found"})
-            continue
-
-        bgm_cn = bgm_result.get("name_cn", "")
-        bgm_score = bgm_result.get("rating", {}).get("score", "—")
-        bgm_id = bgm_result.get("id")
-        conf_tag = f" [{confidence}]" if confidence != "exact" else ""
-        print(f" → {bgm_cn} (评分: {bgm_score}){conf_tag}", end="")
-
-        # Get detailed info
-        bgm_detail = bangumi.get_subject(bgm_id) if bgm_id else None
-
-        # Map metadata
-        updated_meta = map_bangumi_to_kavita(bgm_result, bgm_detail, meta, force=args.force)
-
-        if args.dry_run:
-            print(f" [DRY RUN]")
-            results.append({
-                "name": name, "status": "would_update",
-                "bgm_name": bgm_cn, "score": bgm_score
-            })
-        else:
-            try:
-                kavita.update_series_metadata(updated_meta)
-                print(f" ✓")
-                stats["updated"] += 1
-                results.append({
-                    "name": name, "status": "updated",
-                    "bgm_name": bgm_cn, "score": bgm_score
-                })
-            except Exception as e:
-                print(f" ✗ 更新失败: {e}")
-                stats["error"] += 1
-                results.append({"name": name, "status": "error", "error": str(e)})
-
-    # Summary
-    print(f"\n{'='*60}")
-    print(f"完成!")
-    print(f"  更新: {stats['updated']}")
-    print(f"  跳过: {stats['skipped']}")
-    print(f"  未找到: {stats['not_found']}")
-    print(f"  错误: {stats['error']}")
-
-    # Save results (skip in dry-run to preserve the last real sync's audit record)
-    if args.dry_run:
-        print(f"\n[DRY RUN] 未写入 last_sync_results.json")
+        _do_cover_update(args, kavita, bangumi, overrides)
     else:
-        results_path = Path(__file__).parent / "last_sync_results.json"
-        with open(results_path, "w") as f:
-            json.dump(results, f, ensure_ascii=False, indent=2)
-        print(f"\n详细结果已保存到 {results_path}")
+        _do_metadata_sync(args, kavita, bangumi, overrides)
 
 
 if __name__ == "__main__":
