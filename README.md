@@ -2,13 +2,21 @@
 
 从 [Bangumi](https://bgm.tv/) 抓取漫画元数据，通过 REST API 写入 [Kavita](https://github.com/Kareadita/Kavita)。
 
+## 效果预览
+
+![同步后的系列在 Kavita 中的展示](docs/screenshot.webp)
+
+简介、Bangumi 评分/排名、作者、标签自动填充；卷封面替换为 Bangumi 单行本封面。
+
 ## 功能
 
 - 搜索 Bangumi 匹配 Kavita 中的每个系列
 - 写入：简介、评分、标签、作者、Bangumi 链接
+- 可选替换系列封面和每卷封面为 Bangumi 原图
 - 支持 dry-run 预览模式
 - 支持单系列同步
 - 写入后锁定字段，防止 Kavita 扫描时覆盖
+- `--review` 事后列出低置信度匹配，便于人工核对
 
 ## 配置
 
