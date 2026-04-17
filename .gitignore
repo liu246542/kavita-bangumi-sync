@@ -5,3 +5,4 @@ __pycache__/
 .env
 last_sync_results.json
 CLAUDE.md
+.python-version

@@ -31,8 +31,12 @@ python3 sync.py --series "链锯人"
 
 # 强制覆盖已有数据
 python3 sync.py --force
+
+# 同时更新指定系列的系列封面和各卷封面
+python3 sync.py --series "链锯人" --cover --cover-volumes
 ```
 
 ## 依赖
 
-仅使用 Python 标准库（urllib），无需 pip install。
+- 仅依赖 Python 标准库（urllib）
+- 可选：`pip install opencc`。安装后会把繁体标题转简体再搜索，提高命中率（台/港版漫画尤其明显）
