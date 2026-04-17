@@ -73,7 +73,7 @@ python3 sync.py --overrides-only --force    # 所有 override 条目全部覆盖
 
 ### `--strict` 详解
 
-Bangumi 搜索在 exact / partial 都不命中时，默认会退回搜索结果第一条（输出标记 `[first]`），这常常是不相关的条目。带 `--strict` 后遇到这种情况直接跳过，该系列标为"未找到"——可以事后用 `--review` 看清单，再在 `overrides.json` 里手动指定正确的 subject id。
+Bangumi 搜索在 exact / partial 都不命中时，默认会退回搜索结果第一条（输出标记 `[first]`），这常常是不相关的条目。带 `--strict` 后遇到这种情况直接跳过，该系列标为"未找到"，之后可以用 `--review` 看清单，再在 `overrides.json` 里手动指定正确的 subject id。
 
 典型工作流：
 
@@ -84,7 +84,7 @@ python3 sync.py --review                      # 看哪些被跳过 / 未找到
 python3 sync.py --overrides-only              # 批量把新加的 overrides 写入 Kavita
 ```
 
-加了 overrides 后如果想重新覆盖已有数据（比如原来匹配错了），用 `--overrides-only --force`。该模式下还会检查 `overrides.json` 的 key 是否都能在 Kavita 找到对应系列——不能匹配的会打印警告，通常意味着拼写错了或 Kavita 那边重命名过。
+加了 overrides 后如果想重新覆盖已有数据（比如原来匹配错了），用 `--overrides-only --force`。该模式下还会检查 `overrides.json` 的 key 是否都能在 Kavita 找到对应系列，不能匹配的会打印警告，通常意味着拼写错了或 Kavita 那边重命名过。
 
 ## 手动映射 (`overrides.json`)
 
@@ -102,7 +102,7 @@ python3 sync.py --overrides-only              # 批量把新加的 overrides 写
 - **key**：Kavita 里系列的名字，要与 Kavita UI 完全一致（包括繁简、空格）
 - **value**：Bangumi subject id（整数）
 
-找 subject id 的方法：在 [bgm.tv](https://bgm.tv) 搜到作品打开，浏览器地址栏
+找 subject id 的方法：在 [bgm.tv](https://bgm.tv) 搜到作品后打开详情页，地址栏
 `https://bgm.tv/subject/3510` 里的 `3510` 就是。
 
 命中 override 的系列会跳过自动搜索直接抓取该 subject，置信度标记为 `[映射]`，优先级最高。
