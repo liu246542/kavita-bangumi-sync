@@ -345,11 +345,12 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
             meta["genresLocked"] = True
 
     # Release year
-    if bgm_detail and (force or not meta.get("releaseYear")):
+    if bgm_detail and (force or not meta.get("releaseYearLocked")):
         date_str = bgm_detail.get("date", "")
         if date_str:
             try:
                 meta["releaseYear"] = int(date_str[:4])
+                meta["releaseYearLocked"] = True
             except (ValueError, IndexError):
                 pass
 
@@ -376,7 +377,9 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
             meta["ageRating"] = 4  # X18+
             meta["ageRatingLocked"] = True
 
-    # WebLinks - add/replace Bangumi link
+    # WebLinks - add/replace Bangumi link.
+    # Note: Kavita's SeriesMetadataDto has no webLinksLocked field, but the
+    # scan loop doesn't overwrite webLinks (they aren't read from ComicInfo).
     if bgm_id:
         bgm_url = f"https://bgm.tv/subject/{bgm_id}"
         existing_links = meta.get("webLinks", "") or ""
@@ -384,7 +387,6 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
         other_links = [l for l in existing_links.split(",") if l.strip() and "bgm.tv" not in l]
         other_links.append(bgm_url)
         meta["webLinks"] = ",".join(other_links)
-        meta["webLinksLocked"] = True
 
     # Writers/staff from Bangumi detail
     if bgm_detail and (force or not meta.get("writerLocked")):
