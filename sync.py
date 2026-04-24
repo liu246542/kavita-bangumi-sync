@@ -132,6 +132,19 @@ class KavitaClient:
         body = {"seriesMetadata": metadata_dto}
         return self._request("POST", "/api/series/metadata", body)
 
+    def update_series_name(self, series_dto, localized_name):
+        """Set localizedName (locked). Preserves sortName/coverImageLocked so the
+        server's unconditional assignments don't wipe them."""
+        body = {
+            "id": series_dto["id"],
+            "localizedName": localized_name,
+            "localizedNameLocked": True,
+            "sortName": series_dto.get("sortName"),
+            "sortNameLocked": bool(series_dto.get("sortNameLocked", False)),
+            "coverImageLocked": bool(series_dto.get("coverImageLocked", False)),
+        }
+        return self._request("POST", "/api/series/update", body)
+
 
 # ─── Bangumi API ─────────────────────────────────────────────────────────────
 
@@ -643,6 +656,12 @@ def _do_metadata_sync(args, kavita, bangumi, overrides):
         else:
             try:
                 kavita.update_series_metadata(updated_meta)
+                name_cn = (bgm_result.get("name_cn") or "").strip()
+                if name_cn and name_cn != (series.get("localizedName") or ""):
+                    try:
+                        kavita.update_series_name(series, name_cn)
+                    except Exception as e:
+                        print(f" ⚠ localizedName 失败: {e}", end="")
                 print(f" ✓")
                 stats["updated"] += 1
                 entry["status"] = "updated"
