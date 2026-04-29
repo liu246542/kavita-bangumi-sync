@@ -124,6 +124,10 @@ class KavitaClient:
         }
         return self._request("POST", "/api/series/v2", body)
 
+    def get_series(self, series_id):
+        """Fetch a single SeriesDto. Returns None for 204 No Content."""
+        return self._request("GET", f"/api/series/{series_id}")
+
     def get_series_metadata(self, series_id):
         """Get metadata for a specific series."""
         return self._request("GET", f"/api/series/metadata?seriesId={series_id}")
@@ -152,9 +156,17 @@ class KavitaClient:
         body = {"seriesMetadata": metadata_dto}
         return self._request("POST", "/api/series/metadata", body)
 
-    def update_series_name(self, series_dto, localized_name):
-        """Set localizedName (locked). Preserves sortName/coverImageLocked so the
-        server's unconditional assignments don't wipe them."""
+    def update_series_name(self, series_id, localized_name):
+        """Set localizedName (locked) on a series.
+
+        Re-fetches the latest SeriesDto immediately before the write to
+        round-trip current sortName / sortNameLocked / coverImageLocked.
+        POST /api/series/update assigns those fields unconditionally, so a
+        stale coverImageLocked=false (true→false transition) would silently
+        reset the cover server-side."""
+        series_dto = self.get_series(series_id)
+        if not series_dto:
+            raise RuntimeError(f"series {series_id} 不存在或无访问权限")
         body = {
             "id": series_dto["id"],
             "localizedName": localized_name,
@@ -722,7 +734,7 @@ def _do_metadata_sync(args, kavita, bangumi, overrides):
                 name_cn = (bgm_result.get("name_cn") or "").strip()
                 if name_cn and name_cn != (series.get("localizedName") or ""):
                     try:
-                        kavita.update_series_name(series, name_cn)
+                        kavita.update_series_name(sid, name_cn)
                     except Exception as e:
                         print(f" ⚠ localizedName 失败: {e}", end="")
                 print(f" ✓")
