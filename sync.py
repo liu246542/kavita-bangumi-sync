@@ -21,6 +21,26 @@ from pathlib import Path
 
 HTTP_TIMEOUT = 15
 
+
+def _urlopen_with_retry(req, attempts=2):
+    """urlopen with one extra try on transient failures (5xx, network).
+    4xx HTTPErrors are re-raised immediately so callers can branch on them
+    (e.g. Bangumi's 404 → not found)."""
+    last_exc = None
+    for i in range(attempts):
+        try:
+            return urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                raise
+            last_exc = e
+        except (urllib.error.URLError, TimeoutError) as e:
+            last_exc = e
+        if i < attempts - 1:
+            time.sleep(0.5 * (i + 1))
+    raise last_exc
+
+
 try:
     from opencc import OpenCC
     _t2s = OpenCC("t2s")
@@ -82,7 +102,7 @@ class KavitaClient:
         req.add_header("Authorization", f"Bearer {self.token}")
         req.add_header("Content-Type", "application/json")
         try:
-            resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+            resp = _urlopen_with_retry(req)
             content = resp.read()
             if not content:
                 return None
@@ -165,7 +185,7 @@ class BangumiClient:
         self._throttle()
         req = urllib.request.Request(url, headers={"User-Agent": self.user_agent})
         try:
-            resp = urllib.request.urlopen(req, timeout=HTTP_TIMEOUT)
+            resp = _urlopen_with_retry(req)
             return json.loads(resp.read())
         except urllib.error.HTTPError as e:
             if e.code == 404:
@@ -569,6 +589,12 @@ def _resolve_bangumi(name, localized, overrides, bangumi, strict):
 
     Override path fetches get_subject once and reuses it as both summary
     and detail — the v0 endpoint is a superset of what search returns.
+
+    Search path requires both a search hit AND a successful detail fetch.
+    Persisting on a partial result (search only, no detail) would write the
+    bgm.tv weblink marker without tags/writers/year — and the marker makes
+    future non-force runs skip the series, so a transient detail failure
+    becomes permanent.
     """
     override_id = overrides.get(name)
     if override_id:
@@ -579,10 +605,12 @@ def _resolve_bangumi(name, localized, overrides, bangumi, strict):
     result, confidence = bangumi.search(name, strict=strict)
     if not result and localized and localized != name:
         result, confidence = bangumi.search(localized, strict=strict)
-    if not result:
+    if not result or not result.get("id"):
         return None, None, None
 
-    detail = bangumi.get_subject(result["id"]) if result.get("id") else None
+    detail = bangumi.get_subject(result["id"])
+    if not detail:
+        return None, None, None
     return result, detail, confidence
 
 
