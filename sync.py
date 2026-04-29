@@ -285,18 +285,14 @@ class BangumiClient:
         return self._get(url)
 
     def get_volumes(self, subject_id):
-        """Get list of related 单行本 (volumes) for a subject, sorted by volume number."""
+        """Get list of related 单行本 (volumes) for a subject, sorted by parsed
+        volume number. Unparseable names are pushed to the end."""
         url = f"{self.base_url}/v0/subjects/{subject_id}/subjects"
         data = self._get(url)
         if not data:
             return []
         volumes = [item for item in data if item.get("relation") == "单行本"]
-        # Sort by volume number extracted from name like "大ダーク (1)" or "大ダーク（1）"
-        def vol_num(item):
-            name = item.get("name", "") or item.get("name_cn", "")
-            m = re.search(r'[(（](\d+)[)）]', name)
-            return int(m.group(1)) if m else 0
-        volumes.sort(key=vol_num)
+        volumes.sort(key=lambda v: (_parse_bgm_vol_num(v) is None, _parse_bgm_vol_num(v) or 0))
         return volumes
 
 
@@ -459,9 +455,24 @@ def map_bangumi_to_kavita(bgm_search, bgm_detail, existing_metadata, force=False
 
 # ─── Main ────────────────────────────────────────────────────────────────────
 
-def _vol_sort_key(v):
-    name = v.get("name", "")
-    return int(name) if name.isdigit() else 0
+def _parse_kavita_vol_num(v):
+    """Kavita volume name → int; None for specials/decimals/extras.
+
+    Kavita stores plain integer volumes as '1', '2', etc. Anything else
+    (Special, 1.5, 番外) we treat as unpairable so the cover-volume sync
+    doesn't blindly map specials onto the wrong real volume."""
+    name = (v.get("name") or "").strip()
+    return int(name) if name.isdigit() else None
+
+
+_BGM_VOL_NUM_RE = re.compile(r'[(（](\d+)[)）]')
+
+
+def _parse_bgm_vol_num(item):
+    """Bangumi 单行本 name → int; None if no '(N)' pattern in the name."""
+    name = item.get("name", "") or item.get("name_cn", "")
+    m = _BGM_VOL_NUM_RE.search(name)
+    return int(m.group(1)) if m else None
 
 
 def _filter_to_overrides(all_series, overrides):
@@ -552,20 +563,44 @@ def _do_cover_update(args, kavita, bangumi, overrides):
                 print(f"  [卷封面] Bangumi 没有单行本数据")
                 continue
 
-            kavita_volumes = sorted(kavita.get_volumes(sid), key=_vol_sort_key)
-            print(f"  [卷封面] Bangumi {len(bgm_volumes)} 卷, Kavita {len(kavita_volumes)} 卷")
+            kavita_volumes = kavita.get_volumes(sid)
 
-            for i, kv in enumerate(kavita_volumes):
-                if i >= len(bgm_volumes):
-                    break
-                bv = bgm_volumes[i]
+            # Pair by parsed integer volume number, not list index. Index-based
+            # pairing put specials/decimals (which parse to None / sort to 0)
+            # at the front and shifted real volumes onto the wrong covers,
+            # then locked them — silent and hard to undo.
+            kv_by_num, kv_skipped = {}, []
+            for kv in kavita_volumes:
+                n = _parse_kavita_vol_num(kv)
+                if n is None:
+                    kv_skipped.append(kv.get("name"))
+                elif n not in kv_by_num:
+                    kv_by_num[n] = kv
+            bv_by_num, bv_skipped = {}, []
+            for bv in bgm_volumes:
+                n = _parse_bgm_vol_num(bv)
+                if n is None:
+                    bv_skipped.append(bv.get("name"))
+                elif n not in bv_by_num:
+                    bv_by_num[n] = bv
+
+            paired_nums = sorted(set(kv_by_num) & set(bv_by_num))
+            print(f"  [卷封面] Bangumi {len(bgm_volumes)} 卷, Kavita {len(kavita_volumes)} 卷, 可配对 {len(paired_nums)}")
+            if kv_skipped:
+                print(f"    跳过 Kavita 卷（无法解析卷号）: {', '.join(map(str, kv_skipped))}")
+            if bv_skipped:
+                print(f"    跳过 Bangumi 卷（无法解析卷号）: {', '.join(map(str, bv_skipped))}")
+
+            for n in paired_nums:
+                kv = kv_by_num[n]
+                bv = bv_by_num[n]
                 bv_detail = bangumi.get_subject(bv["id"])
                 if not bv_detail:
                     continue
                 images = bv_detail.get("images", {})
                 cover_url = images.get("large") or images.get("common")
                 if not cover_url:
-                    print(f"    Vol.{kv.get('name')} → 无封面")
+                    print(f"    Vol.{n} → 无封面")
                     continue
 
                 chapters = kv.get("chapters", [])
@@ -574,14 +609,14 @@ def _do_cover_update(args, kavita, bangumi, overrides):
                 chapter_id = chapters[0]["id"]
 
                 if args.dry_run:
-                    print(f"    Vol.{kv.get('name')} ← {bv.get('name')} [DRY RUN]")
+                    print(f"    Vol.{n} ← {bv.get('name')} [DRY RUN]")
                     continue
 
                 try:
                     kavita.upload_chapter_cover(chapter_id, cover_url)
-                    print(f"    Vol.{kv.get('name')} ✓ ← {bv.get('name')}")
+                    print(f"    Vol.{n} ✓ ← {bv.get('name')}")
                 except Exception as e:
-                    print(f"    Vol.{kv.get('name')} ✗ {e}")
+                    print(f"    Vol.{n} ✗ {e}")
 
 
 def _resolve_bangumi(name, localized, overrides, bangumi, strict):
