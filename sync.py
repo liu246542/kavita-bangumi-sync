@@ -102,7 +102,13 @@ class KavitaClient:
         req.add_header("Authorization", f"Bearer {self.token}")
         req.add_header("Content-Type", "application/json")
         try:
-            resp = _urlopen_with_retry(req)
+            # Only retry GETs. Our POSTs (update_series_metadata, upload_*,
+            # update_series_update) are idempotent in current Kavita, but
+            # retrying a write that the server already accepted before 5xx-ing
+            # is the kind of footgun that breaks subtly if Kavita ever grows
+            # side effects (audit rows, scan triggers) per POST.
+            attempts = 2 if method == "GET" else 1
+            resp = _urlopen_with_retry(req, attempts=attempts)
             content = resp.read()
             if not content:
                 return None
@@ -581,19 +587,23 @@ def _do_cover_update(args, kavita, bangumi, overrides):
             # pairing put specials/decimals (which parse to None / sort to 0)
             # at the front and shifted real volumes onto the wrong covers,
             # then locked them — silent and hard to undo.
-            kv_by_num, kv_skipped = {}, []
+            kv_by_num, kv_skipped, kv_dup = {}, [], []
             for kv in kavita_volumes:
                 n = _parse_kavita_vol_num(kv)
                 if n is None:
                     kv_skipped.append(kv.get("name"))
-                elif n not in kv_by_num:
+                elif n in kv_by_num:
+                    kv_dup.append(n)
+                else:
                     kv_by_num[n] = kv
-            bv_by_num, bv_skipped = {}, []
+            bv_by_num, bv_skipped, bv_dup = {}, [], []
             for bv in bgm_volumes:
                 n = _parse_bgm_vol_num(bv)
                 if n is None:
                     bv_skipped.append(bv.get("name"))
-                elif n not in bv_by_num:
+                elif n in bv_by_num:
+                    bv_dup.append(n)
+                else:
                     bv_by_num[n] = bv
 
             paired_nums = sorted(set(kv_by_num) & set(bv_by_num))
@@ -602,6 +612,10 @@ def _do_cover_update(args, kavita, bangumi, overrides):
                 print(f"    跳过 Kavita 卷（无法解析卷号）: {', '.join(map(str, kv_skipped))}")
             if bv_skipped:
                 print(f"    跳过 Bangumi 卷（无法解析卷号）: {', '.join(map(str, bv_skipped))}")
+            if kv_dup:
+                print(f"    ⚠ Kavita 重复卷号（保留首个）: {', '.join(f'Vol.{n}' for n in kv_dup)}")
+            if bv_dup:
+                print(f"    ⚠ Bangumi 重复卷号（保留首个）: {', '.join(f'Vol.{n}' for n in bv_dup)}")
 
             for n in paired_nums:
                 kv = kv_by_num[n]
